@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - 三大任务：任务一 SLAM 迷宫建图（导出**原生 PCD**，30 分）、任务二 路径规划夺宝箱（30 分，联动任务三弹药）、任务三 实机 AprilTag 自动打击（40 分）。
 - 中期检查硬 deadline：**2026-09-12 前**提交（PCD + 一镜到底演示视频），决赛 10 月中旬（天津）。
-- 本工作区**不是 git 仓库**，没有测试/CI/lint，修改前自行备份。
+- 本工作区为 git 仓库（远程 `github.com/Wuu-J/robotac`，私有）：仅跟踪本队代码（`user_code/`）、文档与 PCD；官方平台（7.6GB）被 `.gitignore` 排除。无测试/CI/lint，修改前自行备份。
 - 工作区根目录的其他内容（中文 md 手册、`rules.pdf` 赛题、`bags/`、`.workbuddy/`）是项目文档与另一工具（WorkBuddy）的产物，不是 Claude Code 的。
 
 ## 红线工作约定（用户明确要求，最高优先级）
