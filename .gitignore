@@ -1,0 +1,19 @@
+# 官方 MATRiX 仿真平台（约 7.6GB，含 UE5 二进制与构建产物），不重复上传
+matrix_robotac_first/*
+!matrix_robotac_first/user_code/
+matrix_robotac_first/user_code/__pycache__/
+matrix_robotac_first.zip
+
+# 图片（赛题 PDF 截图等）
+*.png
+*.jpg
+*.jpeg
+
+# 其他工具产物
+bags/
+.claude/
+.workbuddy/
+
+# 临时文件
+steps.txt
+test_sync.txt
