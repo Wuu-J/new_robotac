@@ -49,14 +49,16 @@ def quat_to_R(qw, qx, qy, qz):
 GROUND_Z = 0.15   # 世界系地面带判定阈值（地板 z≈0，步态颠簸留余量）
 
 
-def keep_hits(hits, z, min_hits):
-    """体素保留判据：地面带（z<GROUND_Z）单次命中即保留，其余需 ≥min_hits 次。
+def keep_hits(hits, z, min_hits, ground_min_hits=1):
+    """体素保留判据：地面带（z<GROUND_Z）命中 ≥ground_min_hits 即保留，
+    其余需 ≥min_hits 次。
 
     地面每帧只有稀疏环带且步态颠簸下同一块地面难被多帧重复命中
-    （实测地面密度仅墙面的 1/13），min_hits≥2 会把大部分地面滤掉。
+    （实测同数据 hits≥2 时地面 2160 点 vs hits≥1 时 5980 点，-64%），
+    散点控制靠门控与孤立点剔除，不必牺牲真实地面覆盖。
     算法管线内滤波，非事后加工。
     """
-    return hits >= (1 if z < GROUND_Z else min_hits)
+    return hits >= (ground_min_hits if z < GROUND_Z else min_hits)
 
 
 def main():
@@ -73,6 +75,7 @@ def main():
     print(f'poses {len(poses)} 条，patches {len(patches)} 个')
 
     min_hits = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    ground_min_hits = int(sys.argv[4]) if len(sys.argv) > 4 else 1
     voxel = {}
     for i, name in enumerate(patches):
         if name not in poses:
@@ -101,11 +104,13 @@ def main():
         if (i + 1) % 50 == 0:
             print(f'  已合并 {i + 1}/{len(patches)}')
 
-    # 时间共识：地面带命中≥1 即保留，其余体素 ≥min_hits 个关键帧命中才保留
-    vals = [v for v in voxel.values() if keep_hits(v[3], v[2], min_hits)]
+    # 时间共识：地面带命中 ≥ground_min_hits 即保留，其余体素 ≥min_hits 个关键帧命中才保留
+    vals = [v for v in voxel.values()
+            if keep_hits(v[3], v[2], min_hits, ground_min_hits)]
     n_ground = sum(1 for v in vals if v[2] < GROUND_Z)
     print(f'时间共识: 剔除 {len(voxel) - len(vals)} 个体素'
-          f'（地面带命中≥1 保留 {n_ground} 个，其余命中 <{min_hits} 帧剔除）')
+          f'（地面带命中≥{ground_min_hits} 保留 {n_ground} 个，'
+          f'其余命中 <{min_hits} 帧剔除）')
     merged = np.array(vals, dtype=np.float32)[:, :3]
     with open(out, 'w') as f:
         f.write('# .PCD v0.7 - Point Cloud Data file format\n')

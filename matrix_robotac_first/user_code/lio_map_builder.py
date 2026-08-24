@@ -50,14 +50,16 @@ def quat_to_R(qx, qy, qz, qw):
     ])
 
 
-def keep_hits(hits, z, min_hits, ground_z=0.15):
-    """体素保留判据：地面带（世界系 z<ground_z）单次命中即保留，其余需 ≥min_hits 次。
+def keep_hits(hits, z, min_hits, ground_z=0.15, ground_min_hits=1):
+    """体素保留判据：地面带（世界系 z<ground_z）命中 ≥ground_min_hits 即保留，
+    其余需 ≥min_hits 次。
 
-    地面每帧只有稀疏环带且步态颠簸下同一块地面难被多帧重复命中，
-    min_hits≥2 会把大部分地面滤掉（实测地面密度仅墙面的 1/13）；
-    墙面/高处点仍用 min_hits 时间共识滤杂散。算法管线内滤波。
+    地面每帧只有稀疏环带且步态颠簸让同一块地面难被多帧重复命中同一体素，
+    min_hits≥2 会把大部分地面滤掉（实测同数据 2160→5980，-64%）；
+    野点控制靠门控（拦位姿跳变帧）与孤立点剔除（只杀离散假点），
+    不必牺牲真实地面覆盖。ground_min_hits 留给 A/B 对比用。算法管线内滤波。
     """
-    return hits >= (1 if z < ground_z else min_hits)
+    return hits >= (ground_min_hits if z < ground_z else min_hits)
 
 
 def remove_isolated(voxel_map):
@@ -213,6 +215,7 @@ class LioMapBuilder(Node):
         self.save_after = args.save_after
         self.min_hits = args.min_hits
         self.ground_z = args.ground_z
+        self.ground_min_hits = args.ground_min_hits
         self.isolated = args.isolated
         self.saved = False
         self.voxel_map = {}            # key -> [x, y, z, hits]
@@ -307,7 +310,8 @@ class LioMapBuilder(Node):
         header = Header(frame_id='world')
         header.stamp = self.last_stamp.to_msg()
         vals = [v for v in self.voxel_map.values()
-                if keep_hits(v[3], v[2], self.min_hits, self.ground_z)]
+                if keep_hits(v[3], v[2], self.min_hits, self.ground_z,
+                             self.ground_min_hits)]
         if not vals:
             return
         pts = np.array(vals, dtype=np.float32)[:, :3]
@@ -317,7 +321,8 @@ class LioMapBuilder(Node):
         if self.saved or not self.voxel_map:
             return
         vals = {k: v for k, v in self.voxel_map.items()
-                if keep_hits(v[3], v[2], self.min_hits, self.ground_z)}
+                if keep_hits(v[3], v[2], self.min_hits, self.ground_z,
+                             self.ground_min_hits)}
         n_iso = 0
         if self.isolated:
             vals = remove_isolated(vals)
@@ -343,7 +348,10 @@ def main():
                          '地面带不受此限，命中≥1 即保留）')
     ap.add_argument('--ground-z', type=float, default=0.15,
                     help='地面带判定阈值：世界系 z<此值视为地面（地板 z≈0，'
-                         '步态颠簸留余量），地面体素命中≥1 即保留')
+                         '步态颠簸留余量）')
+    ap.add_argument('--ground-min-hits', type=int, default=1,
+                    help='地面体素命中阈值（默认 1；想牺牲地面覆盖换更少散点可设 2，'
+                         'A/B 对比用）')
     ap.add_argument('--isolated', type=int, default=1, choices=[0, 1],
                     help='保存时剔除孤立体素（26 邻域无任何点，野点/反射散点；'
                          '仅影响保存的 PCD，不影响实时显示）')
