@@ -53,10 +53,17 @@ class LivoxBridge(Node):
         buf = np.frombuffer(msg.data, dtype=np.uint8).reshape(-1, msg.point_step)
         cols = [buf[:, offsets[n]:offsets[n] + 4].copy().view(np.float32)
                 for n in ('x', 'y', 'z')]
+        # 野点过滤（实测仿真有 ~0.56% 野点，z 可到 ±29m）：
+        # 有限值 + lidar 系 z 带 + 限距（fork 端还会再做一次 0.5~15m）
+        ok = np.isfinite(cols[0]) & np.isfinite(cols[1]) & np.isfinite(cols[2])
+        ok &= (cols[2] > -1.5) & (cols[2] < 3.0)
+        r2 = cols[0].astype(np.float64)**2 + cols[1].astype(np.float64)**2 + cols[2].astype(np.float64)**2
+        ok &= (r2 > 0.25) & (r2 < 225.0)
+        idx_keep = np.nonzero(ok)[0]
 
         out = CustomMsg()
         out.header = msg.header
-        out.point_num = len(cols[0])
+        out.point_num = len(idx_keep)
         out.lidar_id = 0
         # 逐点时间：默认全 0（实测仿真帧为"整帧冻结"快照，无帧内畸变——
         # 相邻帧残差呈均匀平移型而非剪切型；给假扫掠时间反而引入假畸变）。
@@ -66,7 +73,7 @@ class LivoxBridge(Node):
             off_ns = ((az + np.pi) / (2.0 * np.pi) * self.sweep_ms * 1e6).astype(np.uint32)
         else:
             off_ns = np.zeros(len(cols[0]), dtype=np.uint32)
-        for i in range(out.point_num):
+        for i in idx_keep:
             p = CustomPoint()
             p.offset_time = int(off_ns[i])   # 单位：纳秒
             p.x = float(cols[0][i])

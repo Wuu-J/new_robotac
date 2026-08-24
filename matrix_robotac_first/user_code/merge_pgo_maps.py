@@ -3,7 +3,10 @@
 
 用法:
     ros2 service call /pgo/save_maps interface/srv/SaveMaps "{file_path: '/xx/final_map', save_patches: true}"
-    python3 merge_pgo_maps.py /xx/final_map /xx/final_map/merged.pcd
+    python3 merge_pgo_maps.py /xx/final_map /xx/final_map/merged.pcd [min_hits=2]
+
+参数 min_hits: 同一体素至少被几个关键帧命中才保留（默认 2，时间共识滤波，
+单帧抖动/杂散层被剔除，地图更整齐；1=关闭）。属于算法管线内滤波，合规。
 
 原理: patches/ 下每个关键帧保存的是 body 系点云，poses.txt 存优化后的全局位姿
 （格式: patch名 x y z qw qx qy qz）。合并 = 逐块变换到全局 + 5cm 体素去重。
@@ -54,6 +57,7 @@ def main():
     patches = sorted(f for f in os.listdir(os.path.join(src, 'patches')) if f.endswith('.pcd'))
     print(f'poses {len(poses)} 条，patches {len(patches)} 个')
 
+    min_hits = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     voxel = {}
     for i, name in enumerate(patches):
         if name not in poses:
@@ -64,13 +68,28 @@ def main():
         t = np.array([x, y, z])
         pts = read_pcd(os.path.join(src, 'patches', name))
         pts_w = (R @ pts.T).T + t
-        keys = (pts_w / 0.05).astype(np.int64)
-        for k, p in zip(keys, pts_w):
-            voxel.setdefault((k[0], k[1], k[2]), p)
+        # 8cm 体素：合并步态相位混叠产生的 3-7cm 条纹；12cm 双面墙仍可分
+        keys = (pts_w / 0.08).astype(np.int64)
+        u, ui = np.unique(keys, axis=0, return_index=True)
+        for k, p in zip(u, pts_w[ui]):
+            kt = (k[0], k[1], k[2])
+            v = voxel.get(kt)
+            if v is None:
+                voxel[kt] = [p[0], p[1], p[2], 1]
+            else:
+                # 质心累积：跨关键帧平均，把不同步态相位的离散偏移拉回均值
+                n = v[3] + 1
+                v[0] = (v[0] * v[3] + p[0]) / n
+                v[1] = (v[1] * v[3] + p[1]) / n
+                v[2] = (v[2] * v[3] + p[2]) / n
+                v[3] = n
         if (i + 1) % 50 == 0:
             print(f'  已合并 {i + 1}/{len(patches)}')
 
-    merged = np.array(list(voxel.values()), dtype=np.float32)
+    # 时间共识：同一体素 ≥min_hits 个关键帧命中才保留（单帧杂散被滤掉）
+    vals = [v for v in voxel.values() if v[3] >= min_hits]
+    print(f'时间共识: 剔除 {len(voxel) - len(vals)} 个体素（命中 <{min_hits} 帧）')
+    merged = np.array(vals, dtype=np.float32)[:, :3]
     with open(out, 'w') as f:
         f.write('# .PCD v0.7 - Point Cloud Data file format\n')
         f.write('VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n')
