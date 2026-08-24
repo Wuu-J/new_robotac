@@ -3,7 +3,7 @@
 
 用法:
     ros2 service call /pgo/save_maps interface/srv/SaveMaps "{file_path: '/xx/final_map', save_patches: true}"
-    python3 merge_pgo_maps.py /xx/final_map /xx/final_map/merged.pcd [min_hits=2]
+    python3 merge_pgo_maps.py /xx/final_map /xx/final_map/merged.pcd [min_hits=2] [ground_min_hits=1] [align_z=1]
 
 参数 min_hits: 同一体素至少被几个关键帧命中才保留（默认 2，时间共识滤波，
 单帧抖动/杂散层被剔除，地图更整齐；1=关闭）。地面带（z<0.15）例外：
@@ -49,6 +49,23 @@ def quat_to_R(qw, qx, qy, qz):
 GROUND_Z = 0.15   # 世界系地面带判定阈值（地板 z≈0，步态颠簸留余量）
 
 
+def estimate_ground_z(pts_w, frac=0.05, band=0.15, min_pts=50):
+    """估计一个 patch 的地面高度（世界系 z）。
+
+    取 patch 内 z 最低 frac 分位数附近 band 内的中位数——迷宫为平地且
+    Mid360 360° 视场，patch 几乎必含地面。LIO z 漂移（实测可跑飞至 10m）
+    使各 patch 地面高度不一致，据此把每个 patch 的 z 拉回 0，墙也随之归位。
+    算法管线内处理，非事后加工。
+    """
+    if len(pts_w) < min_pts:
+        return None
+    z0 = float(np.percentile(pts_w[:, 2], frac * 100))
+    band_pts = pts_w[(pts_w[:, 2] >= z0 - 0.05) & (pts_w[:, 2] < z0 + band)]
+    if len(band_pts) < min_pts:
+        return None
+    return float(np.median(band_pts[:, 2]))
+
+
 def keep_hits(hits, z, min_hits, ground_min_hits=1):
     """体素保留判据：地面带（z<GROUND_Z）命中 ≥ground_min_hits 即保留，
     其余需 ≥min_hits 次。
@@ -76,6 +93,13 @@ def main():
 
     min_hits = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     ground_min_hits = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+    align_z = int(sys.argv[5]) if len(sys.argv) > 5 else 1
+    n_aligned = 0
+    n_dropped = 0
+    # 地面偏移超过此值的 patch 视为位姿彻底损坏，直接丢弃。
+    # 实测 z 跑飞至 10.7m 的 patch 对齐后仍能贡献正确墙/地面（墙 +63%、地面 +69%），
+    # 故默认放宽到 100（基本只丢 NaN 等彻底损坏的）。
+    max_align = float(sys.argv[6]) if len(sys.argv) > 6 else 100.0
     voxel = {}
     for i, name in enumerate(patches):
         if name not in poses:
@@ -86,6 +110,14 @@ def main():
         t = np.array([x, y, z])
         pts = read_pcd(os.path.join(src, 'patches', name))
         pts_w = (R @ pts.T).T + t
+        if align_z:
+            gz = estimate_ground_z(pts_w)
+            if gz is not None:
+                if abs(gz) > max_align:
+                    n_dropped += 1
+                    continue                     # 位姿坏掉的 patch：丢弃不污染
+                pts_w[:, 2] -= gz                 # 地面拉回 z=0，墙随之归位
+                n_aligned += 1
         # 8cm 体素：合并步态相位混叠产生的 3-7cm 条纹；12cm 双面墙仍可分
         keys = (pts_w / 0.08).astype(np.int64)
         u, ui = np.unique(keys, axis=0, return_index=True)
@@ -104,6 +136,9 @@ def main():
         if (i + 1) % 50 == 0:
             print(f'  已合并 {i + 1}/{len(patches)}')
 
+    if align_z:
+        print(f'地面对齐: {n_aligned} 个 patch 已按地面拉回 z=0，'
+              f'{n_dropped} 个 patch 位姿损坏被丢弃')
     # 时间共识：地面带命中 ≥ground_min_hits 即保留，其余体素 ≥min_hits 个关键帧命中才保留
     vals = [v for v in voxel.values()
             if keep_hits(v[3], v[2], min_hits, ground_min_hits)]
