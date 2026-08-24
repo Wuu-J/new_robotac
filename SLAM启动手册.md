@@ -58,9 +58,9 @@ source /opt/ros/humble/setup.bash && source ~/livox_ws/install/setup.bash && cd 
 source /opt/ros/humble/setup.bash && source ~/fastlio2_ws/install/setup.bash && ros2 launch pgo pgo_launch.py
 ```
 
-**终端 4 — 累积地图**：
+**终端 4 — 累积地图**（不带参数：Ctrl+C 自动存时间戳文件，互不覆盖）：
 ```bash
-source /opt/ros/humble/setup.bash && cd ~/matrix_robotac_workspace/matrix_robotac_first/user_code && python3 lio_map_builder.py --out ~/robotac_maps/lio_map.pcd
+source /opt/ros/humble/setup.bash && cd ~/matrix_robotac_workspace/matrix_robotac_first/user_code && python3 lio_map_builder.py
 ```
 
 **终端 5（可选）— 绿色地图 rviz**：
@@ -79,13 +79,12 @@ source /opt/ros/humble/setup.bash && cd ~/matrix_robotac_workspace/matrix_robota
 - 转向 ≤0.4 rad/s（快转圈航向欠转，压力测试见下）
 - 回环成功信号：终端 3 rviz 出现绿色边；或 `ros2 topic echo /pgo/loop_markers --once`
 
-## 保存与合并（建图完成后）
+## 保存与合并（建图完成后，一键归档）
 
 ```bash
-source /opt/ros/humble/setup.bash && source ~/fastlio2_ws/install/setup.bash
-mkdir -p ~/robotac_maps/final_map
-ros2 service call /pgo/save_maps interface/srv/SaveMaps "{file_path: '/home/stylerobotac/robotac_maps/final_map', save_patches: true}"
-python3 ~/matrix_robotac_workspace/matrix_robotac_first/user_code/merge_pgo_maps.py /home/stylerobotac/robotac_maps/final_map /home/stylerobotac/robotac_maps/final_map/merged.pcd
+bash ~/matrix_robotac_workspace/matrix_robotac_first/user_code/save_run.sh
+# → ~/robotac_maps/run_时间戳/ 下：patches/ poses.txt map.pcd merged.pcd merged.xyz
+# 每次调用独立目录互不覆盖；历史结果都在 ~/robotac_maps/
 ```
 
 ## ⚠️ 实测踩坑速查（2026-08-24）
