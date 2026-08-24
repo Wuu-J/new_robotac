@@ -14,7 +14,9 @@ rviz 里闪一下留不住。本节点订阅:
 """
 import argparse
 import bisect
+import os
 import time
+from datetime import datetime
 
 import numpy as np
 import rclpy
@@ -153,11 +155,18 @@ def main():
     ap.add_argument('--min-hits', type=int, default=2,
                     help='体素命中次数 < 此值不保存/不显示（时间共识滤波：'
                          '实测 3-7cm 分层里有大量单次命中噪声，≥2 次才保留）')
-    ap.add_argument('--out', default='lio_map.pcd', help='PCD 输出路径')
+    ap.add_argument('--out', default='',
+                    help='PCD 输出路径（空=自动生成时间戳文件名到 ~/robotac_maps/，'
+                         '每次运行互不覆盖）')
     ap.add_argument('--save-after', type=float, default=0,
                     help='运行 N 秒后自动保存（0=仅 Ctrl+C 保存）')
     ap.add_argument('--publish-hz', type=float, default=1.0, help='/lio_map 发布频率')
     args = ap.parse_args()
+    if not args.out:
+        out_dir = os.path.expanduser('~/robotac_maps')
+        os.makedirs(out_dir, exist_ok=True)
+        args.out = os.path.join(
+            out_dir, f"lio_map_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pcd")
     rclpy.init()
     node = LioMapBuilder(args)
     try:
