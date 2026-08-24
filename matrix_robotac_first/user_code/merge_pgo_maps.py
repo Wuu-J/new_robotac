@@ -96,10 +96,12 @@ def main():
     align_z = int(sys.argv[5]) if len(sys.argv) > 5 else 1
     n_aligned = 0
     n_dropped = 0
-    # 地面偏移超过此值的 patch 视为位姿彻底损坏，直接丢弃。
-    # 实测 z 跑飞至 10.7m 的 patch 对齐后仍能贡献正确墙/地面（墙 +63%、地面 +69%），
-    # 故默认放宽到 100（基本只丢 NaN 等彻底损坏的）。
-    max_align = float(sys.argv[6]) if len(sys.argv) > 6 else 100.0
+    # 地面偏移超过此值的 patch 视为位姿已发散，直接丢弃。
+    # 实测教训：z 跑飞（0.2→10.7m）后 patch 的 x/y/航向同样坏掉，
+    # "全救"策略（max_align=100）救回 z 却把错位墙面全塞进地图 → 大面积重影。
+    # 正确策略：小偏移（正常抖动）对齐，大偏移（发散）丢弃。
+    # 健康 LIO 的 z 漂移应 <0.3m，取 0.5m 留余量。
+    max_align = float(sys.argv[6]) if len(sys.argv) > 6 else 0.5
     voxel = {}
     for i, name in enumerate(patches):
         if name not in poses:
@@ -112,12 +114,14 @@ def main():
         pts_w = (R @ pts.T).T + t
         if align_z:
             gz = estimate_ground_z(pts_w)
-            if gz is not None:
-                if abs(gz) > max_align:
-                    n_dropped += 1
-                    continue                     # 位姿坏掉的 patch：丢弃不污染
-                pts_w[:, 2] -= gz                 # 地面拉回 z=0，墙随之归位
-                n_aligned += 1
+            if gz is None:
+                n_dropped += 1
+                continue                     # 无地面估计：跑飞/损坏 patch，丢弃
+            if abs(gz) > max_align:
+                n_dropped += 1
+                continue                     # 位姿已发散（z 跑飞后 x/y 同样坏），丢弃
+            pts_w[:, 2] -= gz                 # 地面拉回 z=0，墙随之归位
+            n_aligned += 1
         # 8cm 体素：合并步态相位混叠产生的 3-7cm 条纹；12cm 双面墙仍可分
         keys = (pts_w / 0.08).astype(np.int64)
         u, ui = np.unique(keys, axis=0, return_index=True)
