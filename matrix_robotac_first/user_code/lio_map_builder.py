@@ -62,6 +62,22 @@ def keep_hits(hits, z, min_hits, ground_z=0.15, ground_min_hits=1):
     return hits >= (ground_min_hits if z < ground_z else min_hits)
 
 
+def estimate_ground_z(pts_w, frac=0.05, band=0.15, min_pts=50):
+    """估计一帧/一个 patch 的地面高度（世界系 z）。
+
+    取 z 最低 frac 分位数附近 band 内的中位数——迷宫为平地且 Mid360 360°
+    视场，帧几乎必含地面。LIO z 在转弯处漂移（实测 14:44 版 0.3~0.5m），
+    据此把每帧 z 拉回参考高度，地图高度全程统一。算法管线内处理，合规。
+    """
+    if len(pts_w) < min_pts:
+        return None
+    z0 = float(np.percentile(pts_w[:, 2], frac * 100))
+    band_pts = pts_w[(pts_w[:, 2] >= z0 - 0.05) & (pts_w[:, 2] < z0 + band)]
+    if len(band_pts) < min_pts:
+        return None
+    return float(np.median(band_pts[:, 2]))
+
+
 def remove_isolated(voxel_map):
     """剔除孤立体素：26 邻域内无任何其他体素（野点/反射散点）。仅保存时调用。
 
@@ -212,6 +228,9 @@ class LioMapBuilder(Node):
         self.ground_z = args.ground_z
         self.ground_min_hits = args.ground_min_hits
         self.isolated = args.isolated
+        self.align_z = args.align_z
+        self.z_ref = None              # 逐帧地面对齐的参考高度（启动期地面中位数）
+        self._z_init = []
         self.guard_autosave = args.guard_autosave
         self.autosave_done = False
         self.saved = False
@@ -283,6 +302,19 @@ class LioMapBuilder(Node):
         if len(pts) == 0:
             return
         pts_w = (R @ pts.T).T + t
+
+        # 逐帧地面对齐：LIO z 在转弯处漂移（实测 0.3~0.5m，导致地图南北
+        # 高度差 0.3m），按每帧自身地面把 z 拉回启动期参考高度——管线内处理。
+        if self.align_z:
+            gz = estimate_ground_z(pts_w)
+            if gz is not None:
+                if self.z_ref is None:
+                    self._z_init.append(gz)
+                    if len(self._z_init) >= 50:
+                        self.z_ref = float(np.median(self._z_init))
+                        self.get_logger().info(f'地面对齐参考高度: {self.z_ref:.3f} m')
+                else:
+                    pts_w[:, 2] -= (gz - self.z_ref)
 
         keys = (pts_w / self.voxel).astype(np.int64)
         for k, p in zip(keys, pts_w):
@@ -363,6 +395,9 @@ def main():
     ap.add_argument('--ground-min-hits', type=int, default=1,
                     help='地面体素命中阈值（默认 1；想牺牲地面覆盖换更少散点可设 2，'
                          'A/B 对比用）')
+    ap.add_argument('--align-z', type=int, default=1, choices=[0, 1],
+                    help='逐帧地面对齐（1=开，默认）：LIO z 转弯漂移时按每帧地面'
+                         '拉回启动参考高度，地图高度全程统一')
     ap.add_argument('--isolated', type=int, default=1, choices=[0, 1],
                     help='保存时剔除孤立体素（26 邻域无任何点，野点/反射散点；'
                          '仅影响保存的 PCD，不影响实时显示）')
