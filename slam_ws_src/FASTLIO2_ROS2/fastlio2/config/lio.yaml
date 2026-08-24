@@ -14,7 +14,7 @@ cube_len: 300
 det_range: 60
 move_thresh: 1.5
 
-na: 1.0
+na: 0.5
 ng: 0.01
 nba: 0.0001
 nbg: 0.0001

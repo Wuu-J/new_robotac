@@ -58,7 +58,7 @@ class LivoxBridge(Node):
         ok = np.isfinite(cols[0]) & np.isfinite(cols[1]) & np.isfinite(cols[2])
         ok &= (cols[2] > -1.5) & (cols[2] < 3.0)
         r2 = cols[0].astype(np.float64)**2 + cols[1].astype(np.float64)**2 + cols[2].astype(np.float64)**2
-        ok &= (r2 > 0.25) & (r2 < 225.0)
+        ok &= (r2 > 0.25) & (r2 < 100.0)     # 限距 10m（远点角度误差大且落在地图外）
         idx_keep = np.nonzero(ok)[0]
 
         out = CustomMsg()
