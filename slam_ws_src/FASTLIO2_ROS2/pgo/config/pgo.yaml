@@ -10,5 +10,6 @@ loop_time_tresh: 60.0
 loop_score_tresh: 0.15
 loop_submap_half_range: 5
 submap_resolution: 0.1
-min_loop_detect_duration: 5.0# 回环检测总开关（false=只录关键帧+里程计图；实测回环路径使关键帧停录，先关）
+min_loop_detect_duration: 5.0
+# 回环检测总开关（false=只录关键帧+里程计图；实测回环路径使关键帧停录，先关）
 enable_loop: false
