@@ -56,7 +56,7 @@ class LivoxBridge(Node):
         # 野点过滤（实测仿真有 ~0.56% 野点，z 可到 ±29m）：
         # 有限值 + lidar 系 z 带 + 限距（fork 端还会再做一次 0.5~15m）
         ok = np.isfinite(cols[0]) & np.isfinite(cols[1]) & np.isfinite(cols[2])
-        ok &= (cols[2] > -1.5) & (cols[2] < 3.0)
+        ok &= (cols[2] > -2.0) & (cols[2] < 2.5)   # z 带：保住地面点（z≈-0.95，四足步态可颠到 -1.5）
         r2 = cols[0].astype(np.float64)**2 + cols[1].astype(np.float64)**2 + cols[2].astype(np.float64)**2
         ok &= (r2 > 0.25) & (r2 < 100.0)     # 限距 10m（远点角度误差大且落在地图外）
         idx_keep = np.nonzero(ok)[0]
