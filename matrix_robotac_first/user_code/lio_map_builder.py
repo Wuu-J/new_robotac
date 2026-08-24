@@ -8,9 +8,9 @@ rviz 里闪一下留不住。本节点订阅:
 变换到 world 系做 5cm 体素累积（keep-first + 命中计数），
 发布 /lio_map（持久地图, 1Hz）供 rviz 显示；Ctrl+C 或 --save-after 保存 PCD。
 
-位姿异常门控（--guard 默认开）：检测 LIO 位姿跳变/旋转突跳/速度尖峰，
-锁定期间暂停入图，防漂移帧把地图带飞（止血层，只防污染不治漂移；
-渐进漂移的根治在 C++ 层地面约束，后续实施）。
+位姿异常门控（--guard 默认开）：检测 LIO 位姿跳变/旋转突跳/速度尖峰
++ 平地 z 锚定带，异常帧跳过入图防幽灵块；连续异常 10s 后强制恢复入图
+防地图永久冻结（止血层，只防污染不治漂移；根治靠 C++ 层地面约束，后续实施）。
 
 用法:
     source /opt/ros/humble/setup.bash
@@ -87,32 +87,32 @@ def _quat_mul(a, b):
 
 
 class DegeneracyGuard:
-    """LIO 位姿异常门控（止血层）
+    """LIO 位姿异常门控（止血层 v2）
 
     检测: 单帧位置跳变 / 旋转突跳 / 速度尖峰（相对近 20 帧均值 N 倍以上），
     外加绝对高度门控（迷宫为平地，LIO z 偏离启动锚定值超 z_band 即异常——
-    专治三面墙角落"跳高后停在错误高度"的确定性漂移，z 不回来就一直锁），
-    连续 confirm_frames 帧异常后锁定；锁定期间 on_cloud 不入图，
-    防止漂移帧把地图带飞。
+    专治三面墙角落"跳高后停在错误高度"的确定性漂移）。
 
-    定位: 止血层。拦跳变 + 高度漂移（含"跳一次后停在错误高度"模式）；
-    x/y 方向的渐进漂移仍需 C++ 层地面约束根治（后续实施）。
-    锁定期间位姿基准照常跟进（下一帧相对当前位姿检测），
-    连续 release_frames 帧正常后自动解锁继续入图。
+    行为（2026-08-24 实测两处修订）:
+    1. 异常帧**立即跳过**入图（旧版等 3 帧确认才锁，前 2 帧跳变已把整帧点
+       投到错误位置形成幽灵块；地面 min_hits=1 后幽灵更明显——"地图外地面变多"）
+    2. 连续异常超过 max_lock_frames 帧后**强制恢复入图**并打 error 日志
+       （旧版 z 漂移后永不恢复 → 地图永久冻结——"后面的区域不出点云"；
+       强制恢复牺牲精度保完整度，漂移的根治在 C++ 层地面约束，后续实施）
+    3. 恢复正常后立即入图，无需解锁等待
+
     属算法管线内门控（非事后加工），符合 PCD 原生输出红线。
 
     阈值基准（10Hz 帧率）: pos_jump=0.5m/帧=5m/s 远高于机器人 3m/s 上限；
     rot_jump=15°/帧=150°/s 远高于比赛转弯 0.4rad/s=23°/s；
-    z_band=0.3m 远大于步态颠簸 ±0.05m，但小于角落漂移的典型偏移。
+    z_band=0.3m 远大于步态颠簸 ±0.05m；max_lock_frames=100 帧=10s。
     """
     def __init__(self, pos_jump=0.5, rot_jump_deg=15.0, vel_ratio=3.0,
-                 confirm_frames=3, release_frames=10, z_band=0.3,
-                 log_path=None):
+                 max_lock_frames=100, z_band=0.3, log_path=None):
         self.pos_jump = pos_jump
         self.rot_jump_deg = rot_jump_deg
         self.vel_ratio = vel_ratio
-        self.confirm_frames = confirm_frames
-        self.release_frames = release_frames
+        self.max_lock_frames = max_lock_frames   # 连续异常帧上限（0=永不强制恢复）
         self.z_band = z_band           # 绝对高度门控带 m（0=关闭）
         self.z_anchor = None           # 平地锚定高度（启动期 z 中位数）
         self.z_anchor_frames = 50      # 锚定采样帧数（10Hz 下约 5s）
@@ -120,25 +120,24 @@ class DegeneracyGuard:
         self.last_pose = None      # np.array [x,y,z,qx,qy,qz,qw]
         self.last_t = None
         self.vel_hist = []         # 近 20 帧瞬时速度
-        self.bad_streak = 0
-        self.good_streak = 0
-        self.locked = False
-        self.skipped = 0
+        self.abn_streak = 0        # 连续异常帧计数
+        self.skipped = 0           # 累计跳过帧数
         self.last_reason = ''
+        self.event_msg = None      # 一次性消息（供节点打 error）
         self.log = None
         if log_path:
             self.log = open(log_path, 'w')
-            self.log.write('t,skip,pos_jump,rot_jump,vel,mean_vel,locked,bad_streak\n')
+            self.log.write('t,skip,pos_jump,rot_jump,vel,mean_vel,abn_streak\n')
 
     def check(self, pose, t):
-        """返回 True = 锁定（调用方跳过本帧入图）。pose=[x,y,z,qx,qy,qz,qw]，t 秒。"""
+        """返回 True = 跳过本帧入图。pose=[x,y,z,qx,qy,qz,qw]，t 秒。"""
         if self.last_pose is None:
             self.last_pose = pose
             self.last_t = t
             return False
         dt = t - self.last_t
         if dt <= 1e-6:
-            return self.locked        # 时间戳回退/重复：无法判断，维持现状
+            return False            # 时间戳回退/重复：无法判断，不拦
         dp = pose[:3] - self.last_pose[:3]
         pos_jump = float(np.linalg.norm(dp))
         qr = _quat_mul(_quat_inv(self.last_pose[3:]), pose[3:])
@@ -157,7 +156,7 @@ class DegeneracyGuard:
                   f'vel={vel:.2f}m/s(mean {mean_vel:.2f})')
 
         # 绝对高度门控：迷宫为平地，LIO z 偏离启动锚定值超带 → 异常
-        # （跳一次后停在错误高度会持续触发，z 恢复前一直锁定）
+        # （跳一次后停在错误高度会持续触发；连续触发超过上限后强制恢复）
         if self.z_band > 0:
             if len(self._z_init) < self.z_anchor_frames:
                 self._z_init.append(float(pose[2]))
@@ -168,33 +167,28 @@ class DegeneracyGuard:
                 abnormal = True
                 reason += f' z_off={float(pose[2]) - self.z_anchor:+.2f}m'
 
-        if abnormal:
-            self.good_streak = 0
-            self.bad_streak += 1
-            if self.bad_streak >= self.confirm_frames:
-                self.locked = True
-            self.last_reason = reason
-        else:
-            if self.locked:
-                self.good_streak += 1
-                if self.good_streak >= self.release_frames:
-                    self.locked = False
-                    self.bad_streak = 0
-                    self.good_streak = 0
-            else:
-                self.bad_streak = 0
-
-        # 基准照常跟进（即使锁定）：下一帧相对当前位置检测
+        # 基准照常跟进：下一帧相对当前位置检测
         self.last_pose = pose
         self.last_t = t
-        if self.locked:
-            self.skipped += 1
         if self.log is not None:
-            self.log.write(f'{t:.3f},{1 if self.locked else 0},{pos_jump:.4f},'
+            self.log.write(f'{t:.3f},{1 if abnormal else 0},{pos_jump:.4f},'
                            f'{rot_jump:.3f},{vel:.4f},{mean_vel:.4f},'
-                           f'{self.locked},{self.bad_streak}\n')
+                           f'{self.abn_streak}\n')
             self.log.flush()
-        return self.locked
+        if not abnormal:
+            self.abn_streak = 0
+            return False
+        self.abn_streak += 1
+        if self.max_lock_frames > 0 and self.abn_streak >= self.max_lock_frames:
+            # 连续异常达上限：强制恢复入图（保完整度，接受漂移位姿）
+            if self.abn_streak == self.max_lock_frames:
+                self.event_msg = (f'退化门控: 连续异常 {self.abn_streak} 帧达上限，'
+                                  f'强制恢复入图（{reason}；'
+                                  f'此后地图可能随漂移位姿偏移，建议检查 LIO 状态）')
+            return False
+        self.skipped += 1
+        self.last_reason = reason
+        return True
 
 
 class LioMapBuilder(Node):
@@ -215,8 +209,7 @@ class LioMapBuilder(Node):
         if args.guard:
             self.guard = DegeneracyGuard(
                 args.guard_pos_jump, args.guard_rot_jump, args.guard_vel_ratio,
-                args.guard_confirm, args.guard_release, args.guard_z_band,
-                args.guard_log or None)
+                args.guard_max_lock, args.guard_z_band, args.guard_log or None)
 
         self.sub_cloud = self.create_subscription(
             PointCloud2, '/fastlio2/body_cloud', self.on_cloud, 10)
@@ -251,14 +244,18 @@ class LioMapBuilder(Node):
         elif i > 0 and abs(self._odo_t[i - 1] - t_ns) < abs(self._odo_t[i] - t_ns):
             i -= 1
         x, y, z, qx, qy, qz, qw = self._odo_pose[i]
-        # 退化门控：跳变/速度尖峰时暂停入图（防地图污染，止血）
+        # 退化门控：异常帧立即跳过入图（防幽灵块）；连续异常达上限后强制恢复
         if self.guard is not None:
             if self.guard.check(np.array([x, y, z, qx, qy, qz, qw]), t_ns * 1e-9):
                 self.get_logger().warn(
-                    f'退化门控锁定: 跳过本帧入图（{self.guard.last_reason}，'
-                    f'已拦 {self.guard.skipped} 帧）',
+                    f'退化门控跳过: {self.guard.last_reason}'
+                    f'（已拦 {self.guard.skipped} 帧）',
                     throttle_duration_sec=2.0)
                 return
+            if self.guard.event_msg is not None:
+                self.get_logger().error(self.guard.event_msg,
+                                        throttle_duration_sec=2.0)
+                self.guard.event_msg = None
         R = quat_to_R(qx, qy, qz, qw)
         t = np.array([x, y, z])
 
@@ -335,10 +332,9 @@ def main():
                     help='单帧旋转跳变阈值 度（10Hz 下 = 150°/s）')
     ap.add_argument('--guard-vel-ratio', type=float, default=3.0,
                     help='速度尖峰倍数（相对近 20 帧均值；均值 <0.01m/s 时不启用此项）')
-    ap.add_argument('--guard-confirm', type=int, default=3,
-                    help='连续异常 N 帧后锁定')
-    ap.add_argument('--guard-release', type=int, default=10,
-                    help='连续正常 N 帧后解锁')
+    ap.add_argument('--guard-max-lock', type=int, default=100,
+                    help='连续异常帧上限（10Hz 下 100 帧=10s）：达上限强制恢复入图，'
+                         '防止 LIO 漂移不恢复导致地图永久冻结；0=永不强制恢复')
     ap.add_argument('--guard-z-band', type=float, default=0.3,
                     help='绝对高度门控带 m（0=关；迷宫平地，LIO z 偏离启动锚定值超带即锁定，'
                          '专治角落确定性高度漂移）')
