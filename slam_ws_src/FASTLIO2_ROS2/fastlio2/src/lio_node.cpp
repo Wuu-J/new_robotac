@@ -111,6 +111,7 @@ public:
         m_builder_config.t_il << t_il_vec[0], t_il_vec[1], t_il_vec[2];
         m_builder_config.r_il << r_il_vec[0], r_il_vec[1], r_il_vec[2], r_il_vec[3], r_il_vec[4], r_il_vec[5], r_il_vec[6], r_il_vec[7], r_il_vec[8];
         m_builder_config.lidar_cov_inv = config["lidar_cov_inv"].as<double>();
+        m_builder_config.z_prior_w = config["z_prior_w"].as<double>();
     }
 
     void imuCB(const sensor_msgs::msg::Imu::SharedPtr msg)
