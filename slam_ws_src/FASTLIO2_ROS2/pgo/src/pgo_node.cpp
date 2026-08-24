@@ -234,6 +234,9 @@ public:
         }
         if (!cp.cloud)
             return;
+        // 位姿非有限（LIO 退化产物）时跳过，防 NaN 进入 GTSAM 因子图死循环
+        if (!cp.pose.t.allFinite() || !cp.pose.r.allFinite())
+            return;
         builtin_interfaces::msg::Time cur_time;
         cur_time.sec = cp.pose.sec;
         cur_time.nanosec = cp.pose.nsec;
