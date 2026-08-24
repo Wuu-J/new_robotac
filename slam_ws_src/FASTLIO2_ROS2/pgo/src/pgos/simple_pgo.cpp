@@ -1,10 +1,18 @@
 #include "simple_pgo.h"
+#include <chrono>
+#include <cstdio>
 
 SimplePGO::SimplePGO(const Config &config) : m_config(config)
 {
     gtsam::ISAM2Params isam2_params;
-    isam2_params.relinearizeThreshold = 0.01;
-    isam2_params.relinearizeSkip = 1;
+    // 实测停录的根因（见技术报告）：每关键帧 update + 过敏感的重线性化，
+    // 转弯密集关键帧时重线性化耗时秒级 → 阻塞执行器 → 停录。
+    // 参考 FAST_LIO_LC（update 频率 1Hz）与 GTSAM 默认参数放宽。
+    isam2_params.relinearizeThreshold = 0.1;      // 原 0.01 太敏感
+    isam2_params.relinearizeSkip = 25;            // 原 1 每帧都查
+    isam2_params.enableRelinearization = false;   // 禁自动重线性化
+    isam2_params.factorization = gtsam::ISAM2Params::CHOLESKY;
+    isam2_params.cacheLinearizedFactors = true;
     m_isam2 = std::make_shared<gtsam::ISAM2>(isam2_params);
     m_initial_values.clear();
     m_graph.resize(0);
@@ -174,6 +182,8 @@ void SimplePGO::searchForLoopPairs()
 
 void SimplePGO::smoothAndUpdate()
 {
+    // 耗时监控（实测停录疑似 iSAM2 update 耗时秒级阻塞执行器）
+    auto t0 = std::chrono::high_resolution_clock::now();
     bool has_loop = !m_cache_pairs.empty();
     // 添加回环因子
     if (has_loop)
@@ -212,4 +222,11 @@ void SimplePGO::smoothAndUpdate()
     const KeyPoseWithCloud &last_item = m_key_poses.back();
     m_r_offset = last_item.r_global * last_item.r_local.transpose();
     m_t_offset = last_item.t_global - m_r_offset * last_item.t_local;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    if (ms > 1000)
+    {
+        printf("[SimplePGO] WARNING: smoothAndUpdate took %ld ms (keyframes=%zu, loop=%d)\n",
+               ms, m_key_poses.size(), has_loop ? 1 : 0);
+    }
 }
