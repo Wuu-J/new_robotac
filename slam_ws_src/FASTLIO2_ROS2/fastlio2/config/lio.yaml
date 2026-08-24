@@ -20,7 +20,7 @@ nba: 0.0001
 nbg: 0.0001
 
 imu_init_num: 20
-near_search_num: 5
+near_search_num: 8
 ieskf_max_iter: 5
 
 gravity_align: true
