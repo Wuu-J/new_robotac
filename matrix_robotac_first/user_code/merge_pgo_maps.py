@@ -3,7 +3,7 @@
 
 用法:
     ros2 service call /pgo/save_maps interface/srv/SaveMaps "{file_path: '/xx/final_map', save_patches: true}"
-    python3 merge_pgo_maps.py /xx/final_map /xx/final_map/merged.pcd [min_hits=2] [ground_min_hits=1] [align_z=1]
+    python3 merge_pgo_maps.py /xx/final_map /xx/final_map/merged.pcd [min_hits=2] [ground_min_hits=1] [align_z=1] [max_align=0.5] [isolated=1]
 
 参数 min_hits: 同一体素至少被几个关键帧命中才保留（默认 2，时间共识滤波，
 单帧抖动/杂散层被剔除，地图更整齐；1=关闭）。地面带（z<0.15）例外：
@@ -63,6 +63,19 @@ def quat_to_R(qw, qx, qy, qz):
 
 
 GROUND_Z = 0.15   # 世界系地面带判定阈值（地板 z≈0，步态颠簸留余量）
+
+
+def remove_isolated(voxel):
+    """剔除孤立体素：26 邻域内无任何其他体素（野点/反射散点）。
+
+    位姿微小抖动/旋转重影会在墙外产生离散散点，质心平均拿不掉它们；
+    孤立点剔除以体素连通性为准，成片真实结构不受影响。管线内滤波。
+    """
+    keyset = set(voxel)
+    return {kt: v for kt, v in voxel.items()
+            if any((kt[0] + dx, kt[1] + dy, kt[2] + dz) in keyset
+                   for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+                   if (dx or dy or dz))}
 
 
 def estimate_ground_z(pts_w, frac=0.05, band=0.15, min_pts=50):
@@ -179,14 +192,20 @@ def main():
     if align_z:
         print(f'地面对齐: {n_aligned} 个 patch 已按地面拉回 z=0，'
               f'{n_dropped} 个 patch 位姿损坏被丢弃')
+    isolated = int(sys.argv[7]) if len(sys.argv) > 7 else 1
     # 时间共识：地面带命中 ≥ground_min_hits 即保留，其余体素 ≥min_hits 个关键帧命中才保留
-    vals = [v for v in voxel.values()
-            if keep_hits(v[3], v[2], min_hits, ground_min_hits)]
-    n_ground = sum(1 for v in vals if v[2] < GROUND_Z)
-    print(f'时间共识: 剔除 {len(voxel) - len(vals)} 个体素'
+    kept = {kt: v for kt, v in voxel.items()
+            if keep_hits(v[3], v[2], min_hits, ground_min_hits)}
+    n_ground = sum(1 for v in kept.values() if v[2] < GROUND_Z)
+    n_consensus_removed = len(voxel) - len(kept)
+    print(f'时间共识: 剔除 {n_consensus_removed} 个体素'
           f'（地面带命中≥{ground_min_hits} 保留 {n_ground} 个，'
           f'其余命中 <{min_hits} 帧剔除）')
-    merged = np.array(vals, dtype=np.float32)[:, :3]
+    if isolated:
+        kept = remove_isolated(kept)
+        n_iso_removed = len(voxel) - n_consensus_removed - len(kept)
+        print(f'孤立剔除: 再剔除 {n_iso_removed} 个离散体素（野点/反射散点）')
+    merged = np.array(list(kept.values()), dtype=np.float32)[:, :3]
     with open(out, 'w') as f:
         f.write('# .PCD v0.7 - Point Cloud Data file format\n')
         f.write('VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n')
