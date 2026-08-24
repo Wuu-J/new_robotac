@@ -88,11 +88,10 @@ public:
         std::lock_guard<std::mutex>(m_state.message_mutex);
         CloudWithPose cp;
         cp.pose.setTime(cloud_msg->header.stamp.sec, cloud_msg->header.stamp.nanosec);
-        if (cp.pose.second < m_state.last_message_time)
-        {
-            RCLCPP_WARN(this->get_logger(), "Received out of order message");
-            return;
-        }
+        // BUG FIX：原代码在此拒绝时间戳小于 last_message_time 的消息。
+        // 仿真时钟一旦出现一次超前跳变，之后所有消息都被永久拒绝——
+        // 关键帧从此停止录制（实测 merged 缺大半区域的根因）。
+        // ApproximateTime 同步器本身已处理配对，此守卫有害，删除。
         m_state.last_message_time = cp.pose.second;
 
         cp.pose.r = Eigen::Quaterniond(odom_msg->pose.pose.orientation.w,
@@ -192,15 +191,14 @@ public:
     {
         if (m_state.cloud_buffer.size() == 0)
             return;
-        CloudWithPose cp = m_state.cloud_buffer.front();
-        // 清理队列
+        CloudWithPose cp;
         {
             std::lock_guard<std::mutex>(m_state.message_mutex);
-            while (!m_state.cloud_buffer.empty())
-            {
-                m_state.cloud_buffer.pop();
-            }
+            cp = m_state.cloud_buffer.front();
+            m_state.cloud_buffer.pop();
         }
+        // BUG FIX：原代码每拍取队首后把队列全部清空丢弃——执行器稍有延迟
+        // 积压的消息就全部丢失。改为每拍消费一条，积压的留给后续拍次。
         builtin_interfaces::msg::Time cur_time;
         cur_time.sec = cp.pose.sec;
         cur_time.nanosec = cp.pose.nsec;
