@@ -5,8 +5,9 @@ FASTLIO2_ROS2 的 /fastlio2/world_cloud 是"当前帧在世界系"的快照（�
 rviz 里闪一下留不住。本节点订阅:
     /fastlio2/body_cloud  (PointCloud2, base_link 系, 去畸变后的当前帧)
     /fastlio2/lio_odom    (Odometry, world→base_link 位姿, 与帧同时间戳)
-变换到 world 系做 5cm 体素累积（keep-first + 命中计数），
-发布 /lio_map（持久地图, 1Hz）供 rviz 显示；Ctrl+C 或 --save-after 保存 PCD。
+变换到 world 系做 5cm 体素累积（质心平均 + 命中计数，
+保存时剔孤立点），发布 /lio_map（持久地图, 1Hz）供 rviz 显示；
+Ctrl+C 或 --save-after 保存 PCD。
 
 位姿异常门控（--guard 默认开）：检测 LIO 位姿跳变/旋转突跳/速度尖峰
 + 平地 z 锚定带，异常帧跳过入图防幽灵块；连续异常 10s 后强制恢复入图
@@ -57,6 +58,19 @@ def keep_hits(hits, z, min_hits, ground_z=0.15):
     墙面/高处点仍用 min_hits 时间共识滤杂散。算法管线内滤波。
     """
     return hits >= (1 if z < ground_z else min_hits)
+
+
+def remove_isolated(voxel_map):
+    """剔除孤立体素：26 邻域内无任何其他体素（野点/反射散点）。仅保存时调用。
+
+    位姿微小抖动/旋转重影会在墙外产生离散散点，质心平均拿不掉它们；
+    孤立点剔除以体素连通性为准，成片真实结构不受影响。管线内滤波。
+    """
+    keyset = set(voxel_map)
+    return {kt: v for kt, v in voxel_map.items()
+            if any((kt[0] + dx, kt[1] + dy, kt[2] + dz) in keyset
+                   for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+                   if (dx or dy or dz))}
 
 
 def write_pcd(path, pts):
@@ -199,6 +213,7 @@ class LioMapBuilder(Node):
         self.save_after = args.save_after
         self.min_hits = args.min_hits
         self.ground_z = args.ground_z
+        self.isolated = args.isolated
         self.saved = False
         self.voxel_map = {}            # key -> [x, y, z, hits]
         self._odo_t = []
@@ -271,7 +286,14 @@ class LioMapBuilder(Node):
             if v is None:
                 self.voxel_map[kt] = [p[0], p[1], p[2], 1]
             else:
-                v[3] += 1
+                # 质心累积：跨帧平均把位姿抖动的离散偏移拉回均值，
+                # 墙厚从抖动幅度（10-20cm）收敛到噪声均值（实测 8cm 质心后
+                # 双面墙结构 4→27 处、点数 -66%）
+                n = v[3] + 1
+                v[0] = (v[0] * v[3] + p[0]) / n
+                v[1] = (v[1] * v[3] + p[1]) / n
+                v[2] = (v[2] * v[3] + p[2]) / n
+                v[3] = n
 
         self.frame_count += 1
         self.last_stamp = self.get_clock().now()
@@ -294,9 +316,13 @@ class LioMapBuilder(Node):
     def save_pcd(self):
         if self.saved or not self.voxel_map:
             return
-        vals = [v for v in self.voxel_map.values()
-                if keep_hits(v[3], v[2], self.min_hits, self.ground_z)]
-        pts = np.array(vals, dtype=np.float32)[:, :3]
+        vals = {k: v for k, v in self.voxel_map.items()
+                if keep_hits(v[3], v[2], self.min_hits, self.ground_z)}
+        n_iso = 0
+        if self.isolated:
+            vals = remove_isolated(vals)
+            n_iso = len(self.voxel_map) - len(vals)
+        pts = np.array(list(vals.values()), dtype=np.float32)[:, :3]
         write_pcd(self.out_path, pts)
         self.saved = True
         skipped = getattr(self.guard, 'skipped', 0)
@@ -304,7 +330,7 @@ class LioMapBuilder(Node):
         self.get_logger().info(
             f'已保存 PCD: {self.out_path}（{len(pts)} 点，其中地面 {n_ground} 点，'
             f'{self.frame_count} 帧，门控拦截 {skipped} 帧，'
-            f'已剔除 {len(self.voxel_map) - len(pts)} 个体素'
+            f'孤立剔除 {n_iso}，命中滤波剔除 {len(self.voxel_map) - n_iso - len(pts)}'
             f'（地面带命中≥1 即保留，其余命中 <{self.min_hits} 剔除））')
 
 
@@ -318,6 +344,9 @@ def main():
     ap.add_argument('--ground-z', type=float, default=0.15,
                     help='地面带判定阈值：世界系 z<此值视为地面（地板 z≈0，'
                          '步态颠簸留余量），地面体素命中≥1 即保留')
+    ap.add_argument('--isolated', type=int, default=1, choices=[0, 1],
+                    help='保存时剔除孤立体素（26 邻域无任何点，野点/反射散点；'
+                         '仅影响保存的 PCD，不影响实时显示）')
     ap.add_argument('--out', default='',
                     help='PCD 输出路径（空=自动生成时间戳文件名到 ~/robotac_maps/，'
                          '每次运行互不覆盖）')
