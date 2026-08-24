@@ -258,24 +258,8 @@ void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
         share_data.H += J.transpose() * m_config.lidar_cov_inv * J;
         share_data.b += J.transpose() * m_config.lidar_cov_inv * norm_p.intensity;
     }
-
-    // 平地 z 先验（软约束）：迷宫为平地，机器人绝对高度恒定。
-    // 三面墙等退化场景中点面残差对 z 不可观，IMU ba_z 误差持续积分会把 z
-    // 推跑（实测多次跑飞至 10m）。此先验在退化时提供唯一的绝对高度约束；
-    // 正常场景激光地面约束（≈1e5 量级）远强于此先验，几乎无副作用。
-    if (m_config.z_prior_w > 0)
-    {
-        if (!m_z_ref_inited)
-        {
-            m_z_ref = state.t_wi.z();   // 启动时高度（约 0.65），无漂移
-            m_z_ref_inited = true;
-        }
-        Eigen::Matrix<double, 1, 12> Jz = Eigen::Matrix<double, 1, 12>::Zero();
-        Jz(0, 5) = 1.0;                 // t_wi.z 列
-        double rz = state.t_wi.z() - m_z_ref;
-        share_data.H += Jz.transpose() * m_config.z_prior_w * Jz;
-        share_data.b += Jz.transpose() * m_config.z_prior_w * rz;
-    }
+    // 注：z 先验已移除（实测其与奇异 H 耦合时会把 z 残差泄漏进 x/y 更新，
+    // 是偏移/重影的疑似来源）；LIO 以 14:44 实测版为基准。
 }
 
 CloudType::Ptr LidarProcessor::transformCloud(CloudType::Ptr inp, const M3D &r, const V3D &t)

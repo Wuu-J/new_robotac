@@ -20,7 +20,7 @@ nba: 0.0001
 nbg: 0.0001
 
 imu_init_num: 20
-near_search_num: 8
+near_search_num: 5
 ieskf_max_iter: 5
 
 gravity_align: true
@@ -31,4 +31,3 @@ t_il: [0.0, 0.0, 0.3]
 
 lidar_cov_inv: 1000.0
 # 平地 z 先验权重（0=关闭）：迷宫平地，绝对高度软约束，防退化场景 z 漂移/跑飞
-z_prior_w: 10000.0

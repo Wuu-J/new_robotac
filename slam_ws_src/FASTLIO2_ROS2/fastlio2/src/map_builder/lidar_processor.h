@@ -45,8 +45,4 @@ private:
     CloudType::Ptr m_effect_norm_vec;
     std::vector<PointVec> m_nearest_points;
     pcl::VoxelGrid<PointType> m_scan_filter;
-    // 平地 z 先验：迷宫为平地，绝对高度恒定（参考值取启动时高度）。
-    // 三面墙退化场景 z 不可观时仍给绝对约束，防 z 漂移/跑飞。
-    bool m_z_ref_inited = false;
-    double m_z_ref = 0.0;
 };
