@@ -25,6 +25,9 @@ bool SimplePGO::isKeyPose(const PoseWithTime &pose)
     const KeyPoseWithCloud &last_item = m_key_poses.back();
     double delta_trans = (pose.t - last_item.t_local).norm();
     double delta_deg = Eigen::Quaterniond(pose.r).angularDistance(Eigen::Quaterniond(last_item.r_local)) * 57.324;
+    // NaN 守卫：位姿出现非有限值时按关键帧收（否则 NaN 比较恒 false → 停录）
+    if (!std::isfinite(delta_trans) || !std::isfinite(delta_deg))
+        return true;
     if (delta_trans > m_config.key_pose_delta_trans || delta_deg > m_config.key_pose_delta_deg)
         return true;
     return false;
