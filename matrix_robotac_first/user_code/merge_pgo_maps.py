@@ -6,7 +6,9 @@
     python3 merge_pgo_maps.py /xx/final_map /xx/final_map/merged.pcd [min_hits=2]
 
 参数 min_hits: 同一体素至少被几个关键帧命中才保留（默认 2，时间共识滤波，
-单帧抖动/杂散层被剔除，地图更整齐；1=关闭）。属于算法管线内滤波，合规。
+单帧抖动/杂散层被剔除，地图更整齐；1=关闭）。地面带（z<0.15）例外：
+命中≥1 即保留（地面单帧环带稀疏、步态颠簸难多帧重复命中，否则被滤光）。
+属于算法管线内滤波，合规。
 
 原理: patches/ 下每个关键帧保存的是 body 系点云，poses.txt 存优化后的全局位姿
 （格式: patch名 x y z qw qx qy qz）。合并 = 逐块变换到全局 + 5cm 体素去重。
@@ -42,6 +44,19 @@ def quat_to_R(qw, qx, qy, qz):
         [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
         [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
     ])
+
+
+GROUND_Z = 0.15   # 世界系地面带判定阈值（地板 z≈0，步态颠簸留余量）
+
+
+def keep_hits(hits, z, min_hits):
+    """体素保留判据：地面带（z<GROUND_Z）单次命中即保留，其余需 ≥min_hits 次。
+
+    地面每帧只有稀疏环带且步态颠簸下同一块地面难被多帧重复命中
+    （实测地面密度仅墙面的 1/13），min_hits≥2 会把大部分地面滤掉。
+    算法管线内滤波，非事后加工。
+    """
+    return hits >= (1 if z < GROUND_Z else min_hits)
 
 
 def main():
@@ -86,9 +101,11 @@ def main():
         if (i + 1) % 50 == 0:
             print(f'  已合并 {i + 1}/{len(patches)}')
 
-    # 时间共识：同一体素 ≥min_hits 个关键帧命中才保留（单帧杂散被滤掉）
-    vals = [v for v in voxel.values() if v[3] >= min_hits]
-    print(f'时间共识: 剔除 {len(voxel) - len(vals)} 个体素（命中 <{min_hits} 帧）')
+    # 时间共识：地面带命中≥1 即保留，其余体素 ≥min_hits 个关键帧命中才保留
+    vals = [v for v in voxel.values() if keep_hits(v[3], v[2], min_hits)]
+    n_ground = sum(1 for v in vals if v[2] < GROUND_Z)
+    print(f'时间共识: 剔除 {len(voxel) - len(vals)} 个体素'
+          f'（地面带命中≥1 保留 {n_ground} 个，其余命中 <{min_hits} 帧剔除）')
     merged = np.array(vals, dtype=np.float32)[:, :3]
     with open(out, 'w') as f:
         f.write('# .PCD v0.7 - Point Cloud Data file format\n')

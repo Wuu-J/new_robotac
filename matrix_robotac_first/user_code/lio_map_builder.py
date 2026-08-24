@@ -49,6 +49,16 @@ def quat_to_R(qx, qy, qz, qw):
     ])
 
 
+def keep_hits(hits, z, min_hits, ground_z=0.15):
+    """体素保留判据：地面带（世界系 z<ground_z）单次命中即保留，其余需 ≥min_hits 次。
+
+    地面每帧只有稀疏环带且步态颠簸下同一块地面难被多帧重复命中，
+    min_hits≥2 会把大部分地面滤掉（实测地面密度仅墙面的 1/13）；
+    墙面/高处点仍用 min_hits 时间共识滤杂散。算法管线内滤波。
+    """
+    return hits >= (1 if z < ground_z else min_hits)
+
+
 def write_pcd(path, pts):
     pts = np.asarray(pts, dtype=np.float32)
     with open(path, 'w') as f:
@@ -194,6 +204,7 @@ class LioMapBuilder(Node):
         self.out_path = args.out
         self.save_after = args.save_after
         self.min_hits = args.min_hits
+        self.ground_z = args.ground_z
         self.saved = False
         self.voxel_map = {}            # key -> [x, y, z, hits]
         self._odo_t = []
@@ -276,7 +287,8 @@ class LioMapBuilder(Node):
             return
         header = Header(frame_id='world')
         header.stamp = self.last_stamp.to_msg()
-        vals = [v for v in self.voxel_map.values() if v[3] >= self.min_hits]
+        vals = [v for v in self.voxel_map.values()
+                if keep_hits(v[3], v[2], self.min_hits, self.ground_z)]
         if not vals:
             return
         pts = np.array(vals, dtype=np.float32)[:, :3]
@@ -285,15 +297,18 @@ class LioMapBuilder(Node):
     def save_pcd(self):
         if self.saved or not self.voxel_map:
             return
-        vals = [v for v in self.voxel_map.values() if v[3] >= self.min_hits]
+        vals = [v for v in self.voxel_map.values()
+                if keep_hits(v[3], v[2], self.min_hits, self.ground_z)]
         pts = np.array(vals, dtype=np.float32)[:, :3]
         write_pcd(self.out_path, pts)
         self.saved = True
         skipped = getattr(self.guard, 'skipped', 0)
+        n_ground = int(np.count_nonzero(pts[:, 2] < self.ground_z))
         self.get_logger().info(
-            f'已保存 PCD: {self.out_path}（{len(pts)} 点，{self.frame_count} 帧，'
-            f'门控拦截 {skipped} 帧，'
-            f'命中 <{self.min_hits} 次的体素已剔除 {len(self.voxel_map) - len(pts)} 点）')
+            f'已保存 PCD: {self.out_path}（{len(pts)} 点，其中地面 {n_ground} 点，'
+            f'{self.frame_count} 帧，门控拦截 {skipped} 帧，'
+            f'已剔除 {len(self.voxel_map) - len(pts)} 个体素'
+            f'（地面带命中≥1 即保留，其余命中 <{self.min_hits} 剔除））')
 
 
 def main():
@@ -301,7 +316,11 @@ def main():
     ap.add_argument('--voxel', type=float, default=0.05, help='体素大小 m')
     ap.add_argument('--min-hits', type=int, default=2,
                     help='体素命中次数 < 此值不保存/不显示（时间共识滤波：'
-                         '实测 3-7cm 分层里有大量单次命中噪声，≥2 次才保留）')
+                         '实测 3-7cm 分层里有大量单次命中噪声，≥2 次才保留；'
+                         '地面带不受此限，命中≥1 即保留）')
+    ap.add_argument('--ground-z', type=float, default=0.15,
+                    help='地面带判定阈值：世界系 z<此值视为地面（地板 z≈0，'
+                         '步态颠簸留余量），地面体素命中≥1 即保留')
     ap.add_argument('--out', default='',
                     help='PCD 输出路径（空=自动生成时间戳文件名到 ~/robotac_maps/，'
                          '每次运行互不覆盖）')
