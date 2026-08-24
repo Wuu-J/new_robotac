@@ -104,15 +104,6 @@ void IESKF::update()
 
         delta = -H.inverse() * b;
 
-        // 退化防护：三面墙等场景点面残差秩亏使 H 接近奇异，delta 爆炸为
-        // 非有限/巨大值 → 状态被 NaN 污染（实测导致位姿跑飞、地图重影、
-        // PGO 的 GTSAM 在 NaN 上死循环）。放弃本次更新（保留预测状态）。
-        if (!delta.allFinite() || delta.norm() > 10.0)
-        {
-            delta.setZero();
-            break;
-        }
-
         m_x += delta;
         shared_data.iter_num += 1;
 

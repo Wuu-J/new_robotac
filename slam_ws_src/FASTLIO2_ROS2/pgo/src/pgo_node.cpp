@@ -4,10 +4,13 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
-#include <deque>
+#include <queue>
 #include <filesystem>
 #include "pgos/commons.h"
 #include "pgos/simple_pgo.h"
@@ -26,23 +29,11 @@ struct NodeConfig
     std::string local_frame = "lidar";
 };
 
-struct CloudMsg
-{
-    double t;
-    sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud;
-};
-struct OdomMsg
-{
-    double t;
-    nav_msgs::msg::Odometry::ConstSharedPtr pose;
-};
 struct NodeState
 {
-    // 手动按时间戳配对（替代 message_filters ApproximateTime 同步器——
-    // 实测该同步器运行约 35s 后静默饿死，导致关键帧停录、merged 缺大半）
     std::mutex message_mutex;
-    std::deque<CloudMsg> cloud_deque;
-    std::deque<OdomMsg> odom_deque;
+    std::queue<CloudWithPose> cloud_buffer;
+    double last_message_time;
 };
 
 class PGONode : public rclcpp::Node
@@ -54,12 +45,13 @@ public:
         loadParameters();
         m_pgo = std::make_shared<SimplePGO>(m_pgo_config);
         rclcpp::QoS qos = rclcpp::QoS(10);
-        m_cloud_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            m_node_config.cloud_topic, qos, std::bind(&PGONode::cloudCB, this, std::placeholders::_1));
-        m_odom_sub = this->create_subscription<nav_msgs::msg::Odometry>(
-            m_node_config.odom_topic, qos, std::bind(&PGONode::odomCB, this, std::placeholders::_1));
+        m_cloud_sub.subscribe(this, m_node_config.cloud_topic, qos.get_rmw_qos_profile());
+        m_odom_sub.subscribe(this, m_node_config.odom_topic, qos.get_rmw_qos_profile());
         m_loop_marker_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/pgo/loop_markers", 10000);
         m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        m_sync = std::make_shared<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>>(message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>(10), m_cloud_sub, m_odom_sub);
+        m_sync->setAgePenalty(0.1);
+        m_sync->registerCallback(std::bind(&PGONode::syncCB, this, std::placeholders::_1, std::placeholders::_2));
         m_timer = this->create_wall_timer(50ms, std::bind(&PGONode::timerCB, this));
         m_save_map_srv = this->create_service<interface::srv::SaveMaps>("/pgo/save_maps", std::bind(&PGONode::saveMapsCB, this, std::placeholders::_1, std::placeholders::_2));
     }
@@ -90,26 +82,28 @@ public:
         m_pgo_config.submap_resolution = config["submap_resolution"].as<double>();
         m_pgo_config.min_loop_detect_duration = config["min_loop_detect_duration"].as<double>();
     }
-    void cloudCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg)
+    void syncCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg, const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
     {
-        std::lock_guard<std::mutex> lock(m_state.message_mutex);
-        CloudMsg cm;
-        cm.t = cloud_msg->header.stamp.sec + cloud_msg->header.stamp.nanosec * 1e-9;
-        cm.cloud = cloud_msg;
-        m_state.cloud_deque.push_back(cm);
-        while (m_state.cloud_deque.size() > 60)
-            m_state.cloud_deque.pop_front();
-    }
 
-    void odomCB(const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
-    {
-        std::lock_guard<std::mutex> lock(m_state.message_mutex);
-        OdomMsg om;
-        om.t = odom_msg->header.stamp.sec + odom_msg->header.stamp.nanosec * 1e-9;
-        om.pose = odom_msg;
-        m_state.odom_deque.push_back(om);
-        while (m_state.odom_deque.size() > 120)
-            m_state.odom_deque.pop_front();
+        std::lock_guard<std::mutex>(m_state.message_mutex);
+        CloudWithPose cp;
+        cp.pose.setTime(cloud_msg->header.stamp.sec, cloud_msg->header.stamp.nanosec);
+        if (cp.pose.second < m_state.last_message_time)
+        {
+            RCLCPP_WARN(this->get_logger(), "Received out of order message");
+            return;
+        }
+        m_state.last_message_time = cp.pose.second;
+
+        cp.pose.r = Eigen::Quaterniond(odom_msg->pose.pose.orientation.w,
+                                       odom_msg->pose.pose.orientation.x,
+                                       odom_msg->pose.pose.orientation.y,
+                                       odom_msg->pose.pose.orientation.z)
+                        .toRotationMatrix();
+        cp.pose.t = V3D(odom_msg->pose.pose.position.x, odom_msg->pose.pose.position.y, odom_msg->pose.pose.position.z);
+        cp.cloud = CloudType::Ptr(new CloudType);
+        pcl::fromROSMsg(*cloud_msg, *cp.cloud);
+        m_state.cloud_buffer.push(cp);
     }
 
     void sendBroadCastTF(builtin_interfaces::msg::Time &time)
@@ -196,47 +190,17 @@ public:
 
     void timerCB()
     {
-        CloudWithPose cp;
+        if (m_state.cloud_buffer.size() == 0)
+            return;
+        CloudWithPose cp = m_state.cloud_buffer.front();
+        // 清理队列
         {
-            std::lock_guard<std::mutex> lock(m_state.message_mutex);
-            // 手动配对：取最早的 cloud，在 odom 缓冲里找 |dt|<50ms 的最近者。
-            // LIO 在同一回调里发布两者且时间戳一致，此配对等价于精确同步。
-            while (!m_state.cloud_deque.empty())
+            std::lock_guard<std::mutex>(m_state.message_mutex);
+            while (!m_state.cloud_buffer.empty())
             {
-                CloudMsg &cm = m_state.cloud_deque.front();
-                bool found = false;
-                for (auto &om : m_state.odom_deque)
-                {
-                    if (std::abs(om.t - cm.t) < 0.05)
-                    {
-                        cp.cloud = CloudType::Ptr(new CloudType);
-                        pcl::fromROSMsg(*cm.cloud, *cp.cloud);
-                        cp.pose.setTime(cm.cloud->header.stamp.sec, cm.cloud->header.stamp.nanosec);
-                        cp.pose.r = Eigen::Quaterniond(om.pose->pose.pose.orientation.w,
-                                                       om.pose->pose.pose.orientation.x,
-                                                       om.pose->pose.pose.orientation.y,
-                                                       om.pose->pose.pose.orientation.z)
-                                        .toRotationMatrix();
-                        cp.pose.t = V3D(om.pose->pose.pose.position.x, om.pose->pose.pose.position.y,
-                                        om.pose->pose.pose.position.z);
-                        found = true;
-                        break;
-                    }
-                }
-                m_state.cloud_deque.pop_front();
-                if (found)
-                    break;
+                m_state.cloud_buffer.pop();
             }
-            // 清理远早于当前 cloud 的 odom
-            while (!m_state.cloud_deque.empty() && m_state.odom_deque.size() > 2
-                   && m_state.odom_deque.front().t < m_state.cloud_deque.front().t - 0.2)
-                m_state.odom_deque.pop_front();
         }
-        if (!cp.cloud)
-            return;
-        // 位姿非有限（LIO 退化产物）时跳过，防 NaN 进入 GTSAM 因子图死循环
-        if (!cp.pose.t.allFinite() || !cp.pose.r.allFinite())
-            return;
         builtin_interfaces::msg::Time cur_time;
         cur_time.sec = cp.pose.sec;
         cur_time.nanosec = cp.pose.nsec;
@@ -244,19 +208,7 @@ public:
         {
 
             sendBroadCastTF(cur_time);
-            // 诊断：每 5 秒报一次"收到配对帧但不是关键帧"
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "timerCB: non-key pose (kf=%zu), cur (%.2f, %.2f)",
-                                 m_pgo->keyPoses().size(), cp.pose.t.x(), cp.pose.t.y());
             return;
-        }
-
-        // 诊断：每 10 个关键帧报一次（验证录制是否持续推进）
-        static size_t kf_log_counter = 0;
-        if (m_pgo->keyPoses().size() % 10 == 0 || ++kf_log_counter % 50 == 0)
-        {
-            RCLCPP_INFO(this->get_logger(), "keyframes: %zu, latest (%.2f, %.2f)",
-                        m_pgo->keyPoses().size(), cp.pose.t.x(), cp.pose.t.y());
         }
 
         m_pgo->searchForLoopPairs();
@@ -340,9 +292,10 @@ private:
     rclcpp::TimerBase::SharedPtr m_timer;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr m_loop_marker_pub;
     rclcpp::Service<interface::srv::SaveMaps>::SharedPtr m_save_map_srv;
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_cloud_sub;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr m_odom_sub;
+    message_filters::Subscriber<sensor_msgs::msg::PointCloud2> m_cloud_sub;
+    message_filters::Subscriber<nav_msgs::msg::Odometry> m_odom_sub;
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
+    std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>> m_sync;
 };
 
 int main(int argc, char **argv)

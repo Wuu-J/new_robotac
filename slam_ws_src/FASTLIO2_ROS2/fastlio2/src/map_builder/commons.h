@@ -52,10 +52,6 @@ struct Config
     V3D t_il = V3D::Zero();
 
     double lidar_cov_inv = 1000.0;
-
-    // 平地 z 先验权重（0=关闭）。迷宫平地：给 t_wi.z 加绝对高度软约束，
-    // 退化场景防 z 漂移/跑飞；正常场景激光约束主导，先验近乎无副作用。
-    double z_prior_w = 10000.0;
 };
 
 struct IMUData

@@ -242,9 +242,6 @@ void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
         const PointType &norm_p = m_effect_norm_vec->points[i];
         Eigen::Vector3d laser_p_vec(laser_p.x, laser_p.y, laser_p.z);
         Eigen::Vector3d norm_vec(norm_p.x, norm_p.y, norm_p.z);
-        // 回退记录：曾改为 t_il（右扰动链式法则推导上更合理），但实测 t_il
-        // 版本 x/y 漂移/重影反而加重，t_wi 版本（上游原版）建图最好
-        // （lio_map_20260824_144452 实测最接近完美）。此 fork 以实测为准。
         Eigen::Matrix<double, 1, 3> B = -norm_vec.transpose() * state.r_wi * Sophus::SO3d::hat(state.r_il * laser_p_vec + state.t_wi);
         J.block<1, 3>(0, 0) = B;
         J.block<1, 3>(0, 3) = norm_vec.transpose();
@@ -257,24 +254,6 @@ void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
         }
         share_data.H += J.transpose() * m_config.lidar_cov_inv * J;
         share_data.b += J.transpose() * m_config.lidar_cov_inv * norm_p.intensity;
-    }
-
-    // 平地 z 先验（软约束）：迷宫为平地，机器人绝对高度恒定。
-    // 三面墙等退化场景中点面残差对 z 不可观，IMU ba_z 误差持续积分会把 z
-    // 推跑（实测多次跑飞至 10m）。此先验在退化时提供唯一的绝对高度约束；
-    // 正常场景激光地面约束（≈1e5 量级）远强于此先验，几乎无副作用。
-    if (m_config.z_prior_w > 0)
-    {
-        if (!m_z_ref_inited)
-        {
-            m_z_ref = state.t_wi.z();   // 启动时高度（约 0.65），无漂移
-            m_z_ref_inited = true;
-        }
-        Eigen::Matrix<double, 1, 12> Jz = Eigen::Matrix<double, 1, 12>::Zero();
-        Jz(0, 5) = 1.0;                 // t_wi.z 列
-        double rz = state.t_wi.z() - m_z_ref;
-        share_data.H += Jz.transpose() * m_config.z_prior_w * Jz;
-        share_data.b += Jz.transpose() * m_config.z_prior_w * rz;
     }
 }
 

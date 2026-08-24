@@ -5,13 +5,8 @@ FASTLIO2_ROS2 的 /fastlio2/world_cloud 是"当前帧在世界系"的快照（�
 rviz 里闪一下留不住。本节点订阅:
     /fastlio2/body_cloud  (PointCloud2, base_link 系, 去畸变后的当前帧)
     /fastlio2/lio_odom    (Odometry, world→base_link 位姿, 与帧同时间戳)
-变换到 world 系做 5cm 体素累积（keep-first + 命中计数，
-保存时剔孤立点），发布 /lio_map（持久地图, 1Hz）供 rviz 显示；
-Ctrl+C 或 --save-after 保存 PCD。
-
-位姿异常门控（--guard 默认开）：检测 LIO 位姿跳变/旋转突跳/速度尖峰
-+ 平地 z 锚定带，异常帧跳过入图防幽灵块；连续异常 10s 后强制恢复入图
-防地图永久冻结（止血层，只防污染不治漂移；根治靠 C++ 层地面约束，后续实施）。
+变换到 world 系做 5cm 体素累积（keep-first + 命中计数），
+发布 /lio_map（持久地图, 1Hz）供 rviz 显示；Ctrl+C 或 --save-after 保存 PCD。
 
 用法:
     source /opt/ros/humble/setup.bash
@@ -50,31 +45,6 @@ def quat_to_R(qx, qy, qz, qw):
     ])
 
 
-def keep_hits(hits, z, min_hits, ground_z=0.15, ground_min_hits=1):
-    """体素保留判据：地面带（世界系 z<ground_z）命中 ≥ground_min_hits 即保留，
-    其余需 ≥min_hits 次。
-
-    地面每帧只有稀疏环带且步态颠簸让同一块地面难被多帧重复命中同一体素，
-    min_hits≥2 会把大部分地面滤掉（实测同数据 2160→5980，-64%）；
-    野点控制靠门控（拦位姿跳变帧）与孤立点剔除（只杀离散假点），
-    不必牺牲真实地面覆盖。ground_min_hits 留给 A/B 对比用。算法管线内滤波。
-    """
-    return hits >= (ground_min_hits if z < ground_z else min_hits)
-
-
-def remove_isolated(voxel_map):
-    """剔除孤立体素：26 邻域内无任何其他体素（野点/反射散点）。仅保存时调用。
-
-    位姿微小抖动/旋转重影会在墙外产生离散散点，质心平均拿不掉它们；
-    孤立点剔除以体素连通性为准，成片真实结构不受影响。管线内滤波。
-    """
-    keyset = set(voxel_map)
-    return {kt: v for kt, v in voxel_map.items()
-            if any((kt[0] + dx, kt[1] + dy, kt[2] + dz) in keyset
-                   for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
-                   if (dx or dy or dz))}
-
-
 def write_pcd(path, pts):
     pts = np.asarray(pts, dtype=np.float32)
     with open(path, 'w') as f:
@@ -86,122 +56,6 @@ def write_pcd(path, pts):
         np.savetxt(f, pts, fmt='%.4f')
 
 
-def _quat_inv(q):
-    """四元数共轭（单位四元数的逆），q=[x,y,z,w]"""
-    return np.array([-q[0], -q[1], -q[2], q[3]])
-
-
-def _quat_mul(a, b):
-    """四元数乘法 a⊗b，a/b=[x,y,z,w]"""
-    ax, ay, az, aw = a
-    bx, by, bz, bw = b
-    return np.array([
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz])
-
-
-class DegeneracyGuard:
-    """LIO 位姿异常门控（止血层 v2）
-
-    检测: 单帧位置跳变 / 旋转突跳 / 绝对速度超限（里程计发散），
-    外加绝对高度门控（迷宫为平地，LIO z 偏离启动锚定值超 z_band 即异常——
-    专治三面墙角落"跳高后停在错误高度"的确定性漂移）。
-
-    行为（2026-08-24 实测两处修订）:
-    1. 异常帧**立即跳过**入图（旧版等 3 帧确认才锁，前 2 帧跳变已把整帧点
-       投到错误位置形成幽灵块；地面 min_hits=1 后幽灵更明显——"地图外地面变多"）
-    2. 连续异常超过 max_lock_frames 帧后**强制恢复入图**并打 error 日志
-       （旧版 z 漂移后永不恢复 → 地图永久冻结——"后面的区域不出点云"；
-       强制恢复牺牲精度保完整度，漂移的根治在 C++ 层地面约束，后续实施）
-    3. 恢复正常后立即入图，无需解锁等待
-    4. 速度检测用**绝对上限**（>max_vel=4m/s 才判发散）——旧版"相对近 20 帧
-       均值 3 倍"在每次静止起步时误报（历史窗口全 0，1m/s 起步被当尖峰跳帧）
-
-    属算法管线内门控（非事后加工），符合 PCD 原生输出红线。
-
-    阈值基准（10Hz 帧率）: pos_jump=0.5m/帧=5m/s；rot_jump=15°/帧=150°/s
-    远高于比赛转弯 0.4rad/s=23°/s；max_vel=4m/s 高于机器人物理上限 3.7m/s；
-    z_band=0.3m 远大于步态颠簸 ±0.05m；max_lock_frames 默认 0=冻结。
-    """
-    def __init__(self, pos_jump=0.5, rot_jump_deg=15.0, max_vel=4.0,
-                 max_lock_frames=100, z_band=0.3, log_path=None):
-        self.pos_jump = pos_jump
-        self.rot_jump_deg = rot_jump_deg
-        self.max_vel = max_vel
-        self.max_lock_frames = max_lock_frames   # 连续异常帧上限（0=永不强制恢复）
-        self.z_band = z_band           # 绝对高度门控带 m（0=关闭）
-        self.z_anchor = None           # 平地锚定高度（启动期 z 中位数）
-        self.z_anchor_frames = 50      # 锚定采样帧数（10Hz 下约 5s）
-        self._z_init = []
-        self.last_pose = None      # np.array [x,y,z,qx,qy,qz,qw]
-        self.last_t = None
-        self.abn_streak = 0        # 连续异常帧计数
-        self.skipped = 0           # 累计跳过帧数
-        self.last_reason = ''
-        self.event_msg = None      # 一次性消息（供节点打 error）
-        self.log = None
-        if log_path:
-            self.log = open(log_path, 'w')
-            self.log.write('t,skip,pos_jump,rot_jump,vel,abn_streak\n')
-
-    def check(self, pose, t):
-        """返回 True = 跳过本帧入图。pose=[x,y,z,qx,qy,qz,qw]，t 秒。"""
-        if self.last_pose is None:
-            self.last_pose = pose.copy()   # 防御性拷贝：调用方可能复用/修改数组
-            self.last_t = t
-            return False
-        dt = t - self.last_t
-        if dt <= 1e-6:
-            return False            # 时间戳回退/重复：无法判断，不拦
-        dp = pose[:3] - self.last_pose[:3]
-        pos_jump = float(np.linalg.norm(dp))
-        qr = _quat_mul(_quat_inv(self.last_pose[3:]), pose[3:])
-        qw = min(1.0, abs(float(qr[3])))
-        rot_jump = 2.0 * np.degrees(np.arccos(qw))
-        vel = pos_jump / dt
-
-        abnormal = (pos_jump > self.pos_jump
-                    or rot_jump > self.rot_jump_deg
-                    or vel > self.max_vel)
-        reason = f'pos_jump={pos_jump:.2f}m rot_jump={rot_jump:.1f}° vel={vel:.2f}m/s'
-
-        # 绝对高度门控：迷宫为平地，LIO z 偏离启动锚定值超带 → 异常
-        # （跳一次后停在错误高度会持续触发；连续触发超过上限后强制恢复）
-        if self.z_band > 0:
-            if len(self._z_init) < self.z_anchor_frames:
-                self._z_init.append(float(pose[2]))
-                if len(self._z_init) == self.z_anchor_frames:
-                    self.z_anchor = float(np.median(self._z_init))
-            elif self.z_anchor is not None and \
-                    abs(float(pose[2]) - self.z_anchor) > self.z_band:
-                abnormal = True
-                reason += f' z_off={float(pose[2]) - self.z_anchor:+.2f}m'
-
-        # 基准照常跟进：下一帧相对当前位置检测
-        self.last_pose = pose.copy()
-        self.last_t = t
-        if self.log is not None:
-            self.log.write(f'{t:.3f},{1 if abnormal else 0},{pos_jump:.4f},'
-                           f'{rot_jump:.3f},{vel:.4f},{self.abn_streak}\n')
-            self.log.flush()
-        if not abnormal:
-            self.abn_streak = 0
-            return False
-        self.abn_streak += 1
-        if self.max_lock_frames > 0 and self.abn_streak >= self.max_lock_frames:
-            # 连续异常达上限：强制恢复入图（保完整度，接受漂移位姿）
-            if self.abn_streak == self.max_lock_frames:
-                self.event_msg = (f'退化门控: 连续异常 {self.abn_streak} 帧达上限，'
-                                  f'强制恢复入图（{reason}；'
-                                  f'此后地图可能随漂移位姿偏移，建议检查 LIO 状态）')
-            return False
-        self.skipped += 1
-        self.last_reason = reason
-        return True
-
-
 class LioMapBuilder(Node):
     def __init__(self, args):
         super().__init__('lio_map_builder')
@@ -209,22 +63,12 @@ class LioMapBuilder(Node):
         self.out_path = args.out
         self.save_after = args.save_after
         self.min_hits = args.min_hits
-        self.ground_z = args.ground_z
-        self.ground_min_hits = args.ground_min_hits
-        self.isolated = args.isolated
-        self.guard_autosave = args.guard_autosave
-        self.autosave_done = False
         self.saved = False
         self.voxel_map = {}            # key -> [x, y, z, hits]
         self._odo_t = []
         self._odo_pose = []
         self.last_stamp = None
         self.frame_count = 0
-        self.guard = None
-        if args.guard:
-            self.guard = DegeneracyGuard(
-                args.guard_pos_jump, args.guard_rot_jump, args.guard_max_vel,
-                args.guard_max_lock, args.guard_z_band, args.guard_log or None)
 
         self.sub_cloud = self.create_subscription(
             PointCloud2, '/fastlio2/body_cloud', self.on_cloud, 10)
@@ -259,23 +103,6 @@ class LioMapBuilder(Node):
         elif i > 0 and abs(self._odo_t[i - 1] - t_ns) < abs(self._odo_t[i] - t_ns):
             i -= 1
         x, y, z, qx, qy, qz, qw = self._odo_pose[i]
-        # 退化门控：异常帧立即跳过入图（防幽灵块）；漂移不恢复则持续冻结
-        if self.guard is not None:
-            if self.guard.check(np.array([x, y, z, qx, qy, qz, qw]), t_ns * 1e-9):
-                self.get_logger().warn(
-                    f'退化门控跳过: {self.guard.last_reason}'
-                    f'（已拦 {self.guard.skipped} 帧）',
-                    throttle_duration_sec=2.0)
-                if (self.guard_autosave > 0 and not self.autosave_done
-                        and self.guard.abn_streak >= self.guard_autosave):
-                    self.autosave_done = True
-                    self._write_snapshot()
-                return
-            self.autosave_done = False    # 恢复正常，下次冻结可再存快照
-            if self.guard.event_msg is not None:
-                self.get_logger().error(self.guard.event_msg,
-                                        throttle_duration_sec=2.0)
-                self.guard.event_msg = None
         R = quat_to_R(qx, qy, qz, qw)
         t = np.array([x, y, z])
 
@@ -291,9 +118,6 @@ class LioMapBuilder(Node):
             if v is None:
                 self.voxel_map[kt] = [p[0], p[1], p[2], 1]
             else:
-                # keep-first：体素位置锁定首次观测（实测质心平均在 LIO 漂移时
-                # 会把已建墙体拉向漂移位姿、且转弯抖动期墙线跟着弯曲成重影；
-                # keep-first 首次正确位置不受后续抖动/漂移影响，漂移帧由门控拦截）
                 v[3] += 1
 
         self.frame_count += 1
@@ -307,47 +131,22 @@ class LioMapBuilder(Node):
             return
         header = Header(frame_id='world')
         header.stamp = self.last_stamp.to_msg()
-        vals = [v for v in self.voxel_map.values()
-                if keep_hits(v[3], v[2], self.min_hits, self.ground_z,
-                             self.ground_min_hits)]
+        vals = [v for v in self.voxel_map.values() if v[3] >= self.min_hits]
         if not vals:
             return
         pts = np.array(vals, dtype=np.float32)[:, :3]
         self.pub_map.publish(pc2.create_cloud_xyz32(header, pts))
 
-    def _collect_pts(self):
-        """按命中阈值 + 孤立点过滤收集体素点（保存/快照共用）"""
-        vals = {k: v for k, v in self.voxel_map.items()
-                if keep_hits(v[3], v[2], self.min_hits, self.ground_z,
-                             self.ground_min_hits)}
-        if self.isolated:
-            vals = remove_isolated(vals)
-        return np.array(list(vals.values()), dtype=np.float32)[:, :3]
-
-    def _write_snapshot(self):
-        """地图冻结时保存当前已建部分（保护干净前缀，不标记 final saved）"""
-        pts = self._collect_pts()
-        if len(pts) == 0:
-            return
-        path = self.out_path.replace('.pcd', '_frozen.pcd')
-        write_pcd(path, pts)
-        self.get_logger().error(
-            f'地图已冻结 {self.guard.abn_streak} 帧，已保存快照: {path}'
-            f'（{len(pts)} 点）——若漂移长时间不恢复，建议 Ctrl+C 重跑')
-
     def save_pcd(self):
         if self.saved or not self.voxel_map:
             return
-        pts = self._collect_pts()
+        vals = [v for v in self.voxel_map.values() if v[3] >= self.min_hits]
+        pts = np.array(vals, dtype=np.float32)[:, :3]
         write_pcd(self.out_path, pts)
         self.saved = True
-        skipped = getattr(self.guard, 'skipped', 0)
-        n_ground = int(np.count_nonzero(pts[:, 2] < self.ground_z))
         self.get_logger().info(
-            f'已保存 PCD: {self.out_path}（{len(pts)} 点，其中地面 {n_ground} 点，'
-            f'{self.frame_count} 帧，门控拦截 {skipped} 帧，'
-            f'共剔除 {len(self.voxel_map) - len(pts)} 个体素'
-            f'（孤立+命中滤波；地面阈值 {self.ground_min_hits}））')
+            f'已保存 PCD: {self.out_path}（{len(pts)} 点，{self.frame_count} 帧，'
+            f'命中 <{self.min_hits} 次的体素已剔除 {len(self.voxel_map) - len(pts)} 点）')
 
 
 def main():
@@ -355,44 +154,13 @@ def main():
     ap.add_argument('--voxel', type=float, default=0.05, help='体素大小 m')
     ap.add_argument('--min-hits', type=int, default=2,
                     help='体素命中次数 < 此值不保存/不显示（时间共识滤波：'
-                         '实测 3-7cm 分层里有大量单次命中噪声，≥2 次才保留；'
-                         '地面带不受此限，命中≥1 即保留）')
-    ap.add_argument('--ground-z', type=float, default=0.15,
-                    help='地面带判定阈值：世界系 z<此值视为地面（地板 z≈0，'
-                         '步态颠簸留余量）')
-    ap.add_argument('--ground-min-hits', type=int, default=1,
-                    help='地面体素命中阈值（默认 1；想牺牲地面覆盖换更少散点可设 2，'
-                         'A/B 对比用）')
-    ap.add_argument('--isolated', type=int, default=1, choices=[0, 1],
-                    help='保存时剔除孤立体素（26 邻域无任何点，野点/反射散点；'
-                         '仅影响保存的 PCD，不影响实时显示）')
+                         '实测 3-7cm 分层里有大量单次命中噪声，≥2 次才保留）')
     ap.add_argument('--out', default='',
                     help='PCD 输出路径（空=自动生成时间戳文件名到 ~/robotac_maps/，'
                          '每次运行互不覆盖）')
     ap.add_argument('--save-after', type=float, default=0,
                     help='运行 N 秒后自动保存（0=仅 Ctrl+C 保存）')
     ap.add_argument('--publish-hz', type=float, default=1.0, help='/lio_map 发布频率')
-    ap.add_argument('--guard', type=int, default=1, choices=[0, 1],
-                    help='退化门控开关（1=开，默认；检测位姿跳变/速度尖峰，锁定期间暂停入图）')
-    ap.add_argument('--guard-pos-jump', type=float, default=0.5,
-                    help='单帧位置跳变阈值 m（10Hz 下 = 5m/s，远高于机器人 3m/s 上限）')
-    ap.add_argument('--guard-rot-jump', type=float, default=15.0,
-                    help='单帧旋转跳变阈值 度（10Hz 下 = 150°/s）')
-    ap.add_argument('--guard-max-vel', type=float, default=4.0,
-                    help='绝对速度上限 m/s（超过=里程计发散；机器人物理上限 3.7m/s，'
-                         '正常建图 0.3~0.5m/s 远低于此）')
-    ap.add_argument('--guard-max-lock', type=int, default=0,
-                    help='连续异常帧上限（默认 0=漂移不恢复则冻结地图，'
-                         '宁可缺后段也不污染已建部分；实测强制恢复会把漂移位姿'
-                         '的帧重新入图造成重影）。>0 时达上限强制恢复入图')
-    ap.add_argument('--guard-autosave', type=int, default=600,
-                    help='地图冻结达 N 帧（10Hz 下 600 帧=60s）自动保存快照'
-                         '*_frozen.pcd 保护已建部分；0=关闭')
-    ap.add_argument('--guard-z-band', type=float, default=0.3,
-                    help='绝对高度门控带 m（0=关；迷宫平地，LIO z 偏离启动锚定值超带即锁定，'
-                         '专治角落确定性高度漂移）')
-    ap.add_argument('--guard-log', default='',
-                    help='门控 CSV 日志路径（空=不写；事后分析退化时空分布用）')
     args = ap.parse_args()
     if not args.out:
         out_dir = os.path.expanduser('~/robotac_maps')
