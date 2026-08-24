@@ -242,11 +242,10 @@ void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
         const PointType &norm_p = m_effect_norm_vec->points[i];
         Eigen::Vector3d laser_p_vec(laser_p.x, laser_p.y, laser_p.z);
         Eigen::Vector3d norm_vec(norm_p.x, norm_p.y, norm_p.z);
-        // BUG FIX（原上游代码 hat 内是 t_wi）：右扰动误差状态下
-        // d(r_wi q + t_wi)/dδ = -r_wi·hat(q)，q = r_il·p_b + t_il（机体系点）。
-        // 原代码放 t_wi 使旋转雅可比混入随位姿 t_wi 增长的错项——
-        // 离原点越远航向更新越错，是转弯滞后/远端漂移的疑似帮凶。
-        Eigen::Matrix<double, 1, 3> B = -norm_vec.transpose() * state.r_wi * Sophus::SO3d::hat(state.r_il * laser_p_vec + state.t_il);
+        // 回退记录：曾改为 t_il（右扰动链式法则推导上更合理），但实测 t_il
+        // 版本 x/y 漂移/重影反而加重，t_wi 版本（上游原版）建图最好
+        // （lio_map_20260824_144452 实测最接近完美）。此 fork 以实测为准。
+        Eigen::Matrix<double, 1, 3> B = -norm_vec.transpose() * state.r_wi * Sophus::SO3d::hat(state.r_il * laser_p_vec + state.t_wi);
         J.block<1, 3>(0, 0) = B;
         J.block<1, 3>(0, 3) = norm_vec.transpose();
         if (m_config.esti_il)
